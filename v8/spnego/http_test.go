@@ -16,15 +16,21 @@ import (
 	"os"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/gorilla/sessions"
 	"github.com/jcmturner/goidentity/v6"
 	"github.com/jcmturner/gokrb5/v8/client"
 	"github.com/jcmturner/gokrb5/v8/config"
+	"github.com/jcmturner/gokrb5/v8/credentials"
+	"github.com/jcmturner/gokrb5/v8/gssapi"
+	"github.com/jcmturner/gokrb5/v8/iana/nametype"
 	"github.com/jcmturner/gokrb5/v8/keytab"
+	"github.com/jcmturner/gokrb5/v8/messages"
 	"github.com/jcmturner/gokrb5/v8/service"
 	"github.com/jcmturner/gokrb5/v8/test"
 	"github.com/jcmturner/gokrb5/v8/test/testdata"
+	"github.com/jcmturner/gokrb5/v8/types"
 	"github.com/stretchr/testify/assert"
 )
 
@@ -437,4 +443,166 @@ func (smgr SessionMgr) New(w http.ResponseWriter, r *http.Request, k string, v [
 	}
 	s.Values[k] = v
 	return s.Save(r, w)
+}
+
+// staticSessionMgr is a SessionMgr that always returns the same preset session
+// value bytes, allowing tests to control the credentials the session bypass sees.
+type staticSessionMgr struct {
+	b []byte
+}
+
+func (smgr staticSessionMgr) Get(r *http.Request, k string) ([]byte, error) {
+	return smgr.b, nil
+}
+
+func (smgr staticSessionMgr) New(w http.ResponseWriter, r *http.Request, k string, v []byte) error {
+	return nil
+}
+
+func httpServerWithSessionManager(sm service.SessionMgr) *httptest.Server {
+	l := log.New(os.Stderr, "GOKRB5 Service Tests: ", log.LstdFlags)
+	b, _ := hex.DecodeString(testdata.HTTP_KEYTAB)
+	kt := keytab.New()
+	kt.Unmarshal(b)
+	th := http.HandlerFunc(testAppHandler)
+	s := httptest.NewServer(SPNEGOKRB5Authenticate(th, kt, service.Logger(l), service.SessionManager(sm)))
+	return s
+}
+
+// sessionCredsBytes returns marshaled session credentials as they would have been
+// stored in the session after a successful authentication.
+func sessionCredsBytes(t *testing.T, validUntil time.Time) []byte {
+	t.Helper()
+	c := credentials.New("testuser1", "TEST.GOKRB5")
+	c.SetAuthenticated(true)
+	c.SetAuthTime(time.Now().UTC().Add(-1 * time.Hour))
+	c.SetValidUntil(validUntil)
+	b, err := c.Marshal()
+	if err != nil {
+		t.Fatalf("error marshaling session credentials: %v", err)
+	}
+	return b
+}
+
+// rawKRB5TokenAuthHeader builds a raw KRB5 GSS-API token (AP_REQ) around a ticket
+// with the given end time and returns it as an Authorization header value.
+func rawKRB5TokenAuthHeader(t *testing.T, tktEnd time.Time) string {
+	t.Helper()
+	cl := getClient()
+	sname := types.PrincipalName{
+		NameType:   nametype.KRB_NT_PRINCIPAL,
+		NameString: []string{"HTTP", "host.test.gokrb5"},
+	}
+	b, _ := hex.DecodeString(testdata.HTTP_KEYTAB)
+	kt := keytab.New()
+	kt.Unmarshal(b)
+	st := time.Now().UTC()
+	tkt, sessionKey, err := messages.NewTicket(cl.Credentials.CName(), cl.Credentials.Domain(),
+		sname, "TEST.GOKRB5",
+		types.NewKrbFlags(),
+		kt,
+		18,
+		1,
+		st,
+		st,
+		tktEnd,
+		tktEnd.Add(time.Duration(24)*time.Hour),
+	)
+	if err != nil {
+		t.Fatalf("error getting test ticket: %v", err)
+	}
+	k5t, err := NewKRB5TokenAPREQ(cl, tkt, sessionKey, []int{gssapi.ContextFlagInteg, gssapi.ContextFlagConf}, nil)
+	if err != nil {
+		t.Fatalf("error getting test KRB5 token: %v", err)
+	}
+	tb, err := k5t.Marshal()
+	if err != nil {
+		t.Fatalf("error marshaling test KRB5 token: %v", err)
+	}
+	return "Negotiate " + base64.StdEncoding.EncodeToString(tb)
+}
+
+// TestService_SPNEGOKRB_ExpiredSessionCredentials verifies that a request carrying
+// a session whose credentials have expired is no longer served under the
+// authenticated identity. Without an Authorization header the client must be
+// challenged with a 401; with a valid ticket the request must fall through to the
+// direct authentication path and be re-authenticated.
+func TestService_SPNEGOKRB_ExpiredSessionCredentials(t *testing.T) {
+	sm := staticSessionMgr{b: sessionCredsBytes(t, time.Now().UTC().Add(-1*time.Hour))}
+	s := httpServerWithSessionManager(sm)
+	defer s.Close()
+
+	// Expired session credentials and no Authorization header: must be rejected
+	// with a 401 Negotiate challenge, not served under the expired identity.
+	r, _ := http.NewRequest("GET", s.URL, nil)
+	httpResp, err := http.DefaultClient.Do(r)
+	if err != nil {
+		t.Fatalf("Request error: %v\n", err)
+	}
+	assert.Equal(t, http.StatusUnauthorized, httpResp.StatusCode, "Request with expired session credentials must not be served under the session identity")
+	assert.Equal(t, "Negotiate", httpResp.Header.Get("WWW-Authenticate"), "Negotiation header not set by server.")
+	body, _ := io.ReadAll(httpResp.Body)
+	httpResp.Body.Close()
+	assert.NotContains(t, string(body), "Authenticed user:", "Expired session credentials must not reach the inner handler")
+
+	// Expired session credentials but a valid ticket presented: the request falls
+	// through to the direct authentication path and is re-authenticated.
+	r2, _ := http.NewRequest("GET", s.URL, nil)
+	r2.Header.Set(HTTPHeaderAuthRequest, rawKRB5TokenAuthHeader(t, time.Now().UTC().Add(time.Duration(8)*time.Hour)))
+	httpResp2, err := http.DefaultClient.Do(r2)
+	if err != nil {
+		t.Fatalf("Request error: %v\n", err)
+	}
+	defer httpResp2.Body.Close()
+	assert.Equal(t, http.StatusOK, httpResp2.StatusCode, "Request with expired session credentials but a valid ticket should re-authenticate via the direct path")
+}
+
+// TestService_SPNEGOKRB_ValidSessionBypass verifies the session bypass keeps
+// working when the session credentials have not expired: requests are served
+// under the session identity without an Authorization header. A zero ValidUntil
+// is treated as no expiry for backward compatibility with sessions written
+// before the validity period was recorded.
+func TestService_SPNEGOKRB_ValidSessionBypass(t *testing.T) {
+	tests := []struct {
+		name       string
+		validUntil time.Time
+	}{
+		{name: "ValidUntilInFuture", validUntil: time.Now().UTC().Add(1 * time.Hour)},
+		{name: "ValidUntilZero", validUntil: time.Time{}},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			sm := staticSessionMgr{b: sessionCredsBytes(t, tt.validUntil)}
+			s := httpServerWithSessionManager(sm)
+			defer s.Close()
+
+			r, _ := http.NewRequest("GET", s.URL, nil)
+			httpResp, err := http.DefaultClient.Do(r)
+			if err != nil {
+				t.Fatalf("Request error: %v\n", err)
+			}
+			defer httpResp.Body.Close()
+			assert.Equal(t, http.StatusOK, httpResp.StatusCode, "Request with valid session credentials should be served under the session identity")
+			body, _ := io.ReadAll(httpResp.Body)
+			assert.Contains(t, string(body), "Authenticed user: testuser1", "Response should be served under the session identity")
+		})
+	}
+}
+
+// TestService_SPNEGOKRB_ExpiredTicketDirect verifies the direct authentication
+// path rejects an expired ticket with a 401, symmetric with the rejection of
+// expired session credentials on the session bypass path.
+func TestService_SPNEGOKRB_ExpiredTicketDirect(t *testing.T) {
+	s := httpServer()
+	defer s.Close()
+
+	r, _ := http.NewRequest("GET", s.URL, nil)
+	r.Header.Set(HTTPHeaderAuthRequest, rawKRB5TokenAuthHeader(t, time.Now().UTC().Add(-30*time.Minute)))
+	httpResp, err := http.DefaultClient.Do(r)
+	if err != nil {
+		t.Fatalf("Request error: %v\n", err)
+	}
+	defer httpResp.Body.Close()
+	assert.Equal(t, http.StatusUnauthorized, httpResp.StatusCode, "Direct path must reject an expired ticket with a 401")
+	assert.Equal(t, spnegoNegTokenRespReject, httpResp.Header.Get("WWW-Authenticate"), "Reject negotiation header not set by server.")
 }

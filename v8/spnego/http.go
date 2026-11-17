@@ -262,10 +262,20 @@ func SPNEGOKRB5Authenticate(inner http.Handler, kt *keytab.Keytab, settings ...f
 		// Check if there is a session manager and if there is an already established session for this client
 		id, err := getSessionCredentials(spnego, r)
 		if err == nil && id.Authenticated() {
-			// There is an established session so bypass auth and serve
-			spnego.Log("%s - SPNEGO request served under session %s", r.RemoteAddr, id.SessionID())
-			inner.ServeHTTP(w, goidentity.AddToHTTPRequestContext(&id, r))
-			return
+			if id.Expired() {
+				// The credentials held in the session have expired. The request must not be
+				// served under the expired identity. Fall through to the normal SPNEGO
+				// authentication flow so the client is challenged to re-authenticate,
+				// symmetric with the direct path that rejects expired tickets with a 401.
+				// A zero ValidUntil is treated as no expiry (Expired() returns false) so
+				// sessions written before ValidUntil was recorded keep working.
+				spnego.Log("%s - SPNEGO session %s credentials expired at %s, re-authentication required", r.RemoteAddr, id.SessionID(), id.ValidUntil())
+			} else {
+				// There is an established session so bypass auth and serve
+				spnego.Log("%s - SPNEGO request served under session %s", r.RemoteAddr, id.SessionID())
+				inner.ServeHTTP(w, goidentity.AddToHTTPRequestContext(&id, r))
+				return
+			}
 		}
 
 		st, err := getAuthorizationNegotiationHeaderAsSPNEGOToken(spnego, r, w)
